@@ -280,6 +280,115 @@ class RoleReconcilerTest {
     }
 
     @Test
+    @DisplayName(
+            "When reconciling over a connection that cannot read pg_authid (like on RDS), a password change should still be applied"
+    )
+    void restrictedConnection_passwordChange_isAppliedThroughTransaction() {
+        // given: a superuser connection we use to set up and to verify the result
+        var adminClusterConnection = given.one()
+                .clusterConnection()
+                .withName("test-connection-rds-admin")
+                .returnFirst();
+
+        var adminDsl = postgreSQLContextFactory.getDSLContext(adminClusterConnection);
+
+        // and: a non-superuser CREATEROLE login role. As on RDS, it cannot SELECT pg_authid, but it
+        // can create and alter the roles it owns.
+        var limitedAdminName = "test_rds_limited_admin";
+        var limitedAdminPassword = "limited-admin-password";
+
+        adminDsl.execute(query("drop role if exists {0}", role(limitedAdminName)));
+        adminDsl.execute(query(
+                "create role {0} with login createrole password {1}",
+                role(limitedAdminName),
+                val(limitedAdminPassword)
+        ));
+
+        var roleName = "test-role-rds-password-change";
+
+        // and: a ClusterConnection that authenticates as the limited (RDS-like) role
+        var limitedSecretRef = given.one()
+                .secretRef()
+                .withUsername(limitedAdminName)
+                .withPassword(limitedAdminPassword)
+                .returnFirst();
+
+        var limitedClusterConnection = given.one()
+                .clusterConnection()
+                .withName("test-connection-rds-limited")
+                .withAdminSecretRef(limitedSecretRef)
+                .returnFirst();
+
+        var initialPassword = "initial-password";
+        var newPassword = "new-password";
+
+        var passwordSecretRef = given.one()
+                .secretRef()
+                .withPassword(initialPassword)
+                .returnFirst();
+
+        var passwordSecret = kubernetesClient.secrets()
+                .inNamespace(kubernetesClient.getNamespace())
+                .withName(passwordSecretRef.getName())
+                .require();
+
+        // when: create the Role over the limited connection (the create path does not read pg_authid)
+        var role = given.one()
+                .role()
+                .withName(roleName)
+                .withClusterConnectionName(limitedClusterConnection.getMetadata().getName())
+                .withPasswordSecretRef(passwordSecretRef)
+                .returnFirst();
+
+        try {
+            // then: the initial password is applied
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollInterval(100, TimeUnit.MILLISECONDS)
+                    .until(() -> postgreSQLAuthenticationService.passwordMatches(
+                            adminDsl,
+                            role.getSpec(),
+                            initialPassword
+                    ));
+
+            // when: the password is rotated in the Secret. This triggers a reconcile that must run
+            // ALTER ROLE through the same transaction in which reading pg_authid fails.
+            passwordSecret.getMetadata().setManagedFields(null);
+            var rotatedSecret = new SecretBuilder(passwordSecret)
+                    .addToStringData(SECRET_DATA_BASIC_AUTH_PASSWORD_KEY, newPassword)
+                    .build();
+
+            kubernetesClient.secrets()
+                    .inNamespace(kubernetesClient.getNamespace())
+                    .resource(rotatedSecret)
+                    .serverSideApply();
+
+            // then: the new password should eventually be applied
+            await().atMost(10, TimeUnit.SECONDS)
+                    .pollInterval(200, TimeUnit.MILLISECONDS)
+                    .until(() -> postgreSQLAuthenticationService.passwordMatches(
+                            adminDsl,
+                            role.getSpec(),
+                            newPassword
+                    ));
+        } finally {
+            // Delete the Role CR first so the operator drops the DB role via the still-valid limited
+            // connection, then drop the limited admin role as superuser.
+            kubernetesClient.resources(Role.class)
+                    .inNamespace(role.getMetadata().getNamespace())
+                    .withName(roleName)
+                    .withTimeout(5, TimeUnit.SECONDS)
+                    .delete();
+
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollInterval(100, TimeUnit.MILLISECONDS)
+                    .until(() -> !roleService.roleExists(adminDsl, role.getSpec()));
+
+            adminDsl.execute(query("drop role if exists {0}", role(roleName)));
+            adminDsl.execute(query("drop role if exists {0}", role(limitedAdminName)));
+        }
+    }
+
+    @Test
     @DisplayName("When a Role references a missing ClusterConnection, status should be PENDING with a helpful message")
     void createRole_withMissingClusterConnection_setsPending() {
         // given

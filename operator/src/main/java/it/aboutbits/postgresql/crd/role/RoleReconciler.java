@@ -331,6 +331,7 @@ public class RoleReconciler
             roleService.alterRole(
                     tx,
                     spec,
+                    currentFlags,
                     changePassword,
                     password
             );

@@ -22,6 +22,8 @@ import java.util.HexFormat;
 import java.util.Locale;
 
 import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_AUTHID;
+import static org.jooq.impl.DSL.field;
+import static org.jooq.impl.DSL.val;
 
 @Slf4j
 @Singleton
@@ -54,15 +56,42 @@ public final class PostgreSQLAuthenticationService {
     /**
      * Compare the desired password against the verifier PostgreSQL stores in {@code pg_authid}.
      * <p>
-     * Returns {@link PasswordCheck#UNVERIFIABLE} when {@code pg_authid} cannot be read (SQLSTATE
-     * {@code 42501}), so callers can fall back to a tracked hash instead of treating the situation
-     * as a mismatch and rewriting the password on every reconcile.
+     * Returns {@link PasswordCheck#UNVERIFIABLE} when {@code pg_authid} cannot be read (e.g. on AWS
+     * RDS, where SELECT is denied to every role), so callers can fall back to comparing the tracked
+     * Secret version instead of treating the situation as a mismatch and rewriting the password on
+     * every reconcile.
+     * <p>
+     * The privilege is probed with {@code has_table_privilege} <em>before</em> touching
+     * {@code pg_authid}. This matters because {@code checkPassword} runs inside the reconcile
+     * transaction: reading {@code pg_authid} without access raises SQLSTATE {@code 42501}, which
+     * aborts the whole transaction (SQLSTATE {@code 25P02}) and makes every following write — such
+     * as the {@code ALTER ROLE} that rotates the password — fail. {@code has_table_privilege} is
+     * world-readable, so probing it first never poisons the transaction.
      */
     public PasswordCheck checkPassword(
             DSLContext dsl,
             RoleSpec spec,
             String expectedPassword
     ) {
+        // Probe access first: reading pg_authid without permission raises 42501 and aborts the
+        // surrounding transaction. has_table_privilege is world-readable and safe to call here.
+        var canReadAuthid = Boolean.TRUE.equals(
+                dsl.select(field(
+                                "has_table_privilege({0}, 'SELECT')",
+                                Boolean.class,
+                                val("pg_catalog.pg_authid")
+                        ))
+                        .fetchOne(0, Boolean.class)
+        );
+
+        if (!canReadAuthid) {
+            log.debug(
+                    "Cannot read pg_authid to verify the password for role [{}]; falling back to tracked Secret version",
+                    spec.getName()
+            );
+            return PasswordCheck.UNVERIFIABLE;
+        }
+
         String currentPasswordVerifier;
         try {
             currentPasswordVerifier = dsl
@@ -71,9 +100,14 @@ public final class PostgreSQLAuthenticationService {
                     .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
                     .fetchSingle(PG_AUTHID.ROLPASSWORD);
         } catch (DataAccessException e) {
+            // Defensive only. The has_table_privilege probe above is the real guard against 42501;
+            // this catch just handles the narrow TOCTOU case where SELECT privilege is revoked
+            // between the probe and this read. Note it cannot un-poison the transaction: if the
+            // SELECT does raise 42501 the transaction is already aborted server-side, so a later
+            // write in the same transaction will still fail with 25P02 and the reconcile retries.
             if (isInsufficientPrivilege(e)) {
                 log.debug(
-                        "Cannot read pg_authid to verify the password for role [{}]; falling back to tracked hash",
+                        "Cannot read pg_authid to verify the password for role [{}]; falling back to tracked Secret version",
                         spec.getName()
                 );
                 return PasswordCheck.UNVERIFIABLE;
