@@ -17,9 +17,9 @@ import io.quarkiverse.operatorsdk.annotations.AdditionalRBACRules;
 import io.quarkiverse.operatorsdk.annotations.RBACRule;
 import it.aboutbits.postgresql.core.BaseReconciler;
 import it.aboutbits.postgresql.core.CRPhase;
-import it.aboutbits.postgresql.core.CRStatus;
 import it.aboutbits.postgresql.core.KubernetesService;
 import it.aboutbits.postgresql.core.PostgreSQLAuthenticationService;
+import it.aboutbits.postgresql.core.PostgreSQLAuthenticationService.PasswordCheck;
 import it.aboutbits.postgresql.core.PostgreSQLContextFactory;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -43,7 +43,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 @NullMarked
 public class RoleReconciler
-        extends BaseReconciler<Role, CRStatus>
+        extends BaseReconciler<Role, RoleStatus>
         implements Reconciler<Role>, Cleaner<Role> {
     private final RoleService roleService;
     private final KubernetesService kubernetesService;
@@ -99,14 +99,18 @@ public class RoleReconciler
         var passwordSecretRef = spec.getPasswordSecretRef();
 
         String password;
+        String passwordSecretVersion;
         if (passwordSecretRef != null) {
-            password = kubernetesService.getSecretRefCredentials(
+            var secretData = kubernetesService.getSecretRefData(
                     kubernetesClient,
                     passwordSecretRef,
                     namespace
-            ).password();
+            );
+            password = secretData.credentials().password();
+            passwordSecretVersion = secretData.resourceVersion();
         } else {
             password = null;
+            passwordSecretVersion = null;
         }
 
         UpdateControl<Role> updateControl;
@@ -118,7 +122,8 @@ public class RoleReconciler
                             cfg.dsl(),
                             resource,
                             status,
-                            password
+                            password,
+                            passwordSecretVersion
                     )
             );
         } catch (Exception e) {
@@ -239,15 +244,16 @@ public class RoleReconciler
     }
 
     @Override
-    protected CRStatus newStatus() {
-        return new CRStatus();
+    protected RoleStatus newStatus() {
+        return new RoleStatus();
     }
 
     private UpdateControl<Role> reconcileInTransaction(
             DSLContext tx,
             Role resource,
-            CRStatus status,
-            @Nullable String password
+            RoleStatus status,
+            @Nullable String password,
+            @Nullable String passwordSecretVersion
     ) {
         var namespace = resource.getMetadata().getNamespace();
         var name = resource.getMetadata().getName();
@@ -269,6 +275,14 @@ public class RoleReconciler
                     password
             );
 
+            // Track the Secret version we applied the password from, so we can detect changes later
+            // even on clusters where pg_authid cannot be read to verify it directly (e.g. AWS RDS).
+            status.setAppliedPasswordSecretVersion(
+                    password != null
+                            ? passwordSecretVersion
+                            : null
+            );
+
             status.setPhase(CRPhase.READY)
                     .setMessage(null);
 
@@ -286,11 +300,13 @@ public class RoleReconciler
         var loginExpected = passwordSecretRef != null;
 
         if (loginExpected && password != null) {
-            passwordMatches = postgreSQLAuthenticationService.passwordMatches(
-                    tx,
-                    spec,
-                    password
-            );
+            // Prefer verifying against the PostgreSQL verifier in pg_authid. When that cannot be
+            // read (UNVERIFIABLE, e.g. on RDS), fall back to comparing the current Secret version
+            // against the one we last applied.
+            var check = postgreSQLAuthenticationService.checkPassword(tx, spec, password);
+            passwordMatches = check == PasswordCheck.UNVERIFIABLE
+                    ? Objects.equals(status.getAppliedPasswordSecretVersion(), passwordSecretVersion)
+                    : check == PasswordCheck.MATCH;
         }
 
         if (roleLoginMatches && passwordMatches && flagsMatch && commentMatches) {
@@ -315,9 +331,18 @@ public class RoleReconciler
             roleService.alterRole(
                     tx,
                     spec,
+                    currentFlags,
                     changePassword,
                     password
             );
+        }
+
+        // Keep the tracked Secret version in sync with what we just applied: clear it when the role
+        // has no password (NOLOGIN), refresh it when we changed the password.
+        if (!loginExpected) {
+            status.setAppliedPasswordSecretVersion(null);
+        } else if (changePassword && password != null) {
+            status.setAppliedPasswordSecretVersion(passwordSecretVersion);
         }
 
         if (!flagsMatch) {

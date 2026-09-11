@@ -76,6 +76,20 @@ public final class KubernetesService {
             ResourceRef secretRef,
             String defaultNamespace
     ) {
+        return getSecretRefData(kubernetesClient, secretRef, defaultNamespace).credentials();
+    }
+
+    /**
+     * Fetch the referenced Secret once and return both its credentials and its
+     * {@code metadata.resourceVersion}. The resourceVersion is an opaque, non-sensitive token that
+     * changes whenever the Secret is mutated; callers use it to detect password changes without
+     * having to store any password-derived material.
+     */
+    public SecretRefData getSecretRefData(
+            KubernetesClient kubernetesClient,
+            ResourceRef secretRef,
+            String defaultNamespace
+    ) {
         var secretNamespace = getSecretNamespace(secretRef, defaultNamespace);
 
         var secretName = secretRef.getName();
@@ -129,9 +143,9 @@ public final class KubernetesService {
                 Charset.defaultCharset()
         );
 
-        return new Credentials(
-                username,
-                password
+        return new SecretRefData(
+                new Credentials(username, password),
+                secret.getMetadata().getResourceVersion()
         );
     }
 
@@ -150,6 +164,15 @@ public final class KubernetesService {
     private record FileCredentials(
             @Nullable String username,
             @Nullable String password
+    ) {
+    }
+
+    /**
+     * A referenced Secret's credentials together with its {@code metadata.resourceVersion}.
+     */
+    public record SecretRefData(
+            Credentials credentials,
+            @Nullable String resourceVersion
     ) {
     }
 }

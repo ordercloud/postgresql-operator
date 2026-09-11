@@ -5,6 +5,7 @@ import it.aboutbits.postgresql.crd.role.RoleSpec;
 import jakarta.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 import org.jooq.DSLContext;
+import org.jooq.exception.DataAccessException;
 import org.jspecify.annotations.NullMarked;
 
 import javax.crypto.Mac;
@@ -14,12 +15,15 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.Locale;
 
 import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_AUTHID;
+import static org.jooq.impl.DSL.field;
+import static org.jooq.impl.DSL.val;
 
 @Slf4j
 @Singleton
@@ -30,40 +34,136 @@ public final class PostgreSQLAuthenticationService {
     private static final String HMAC_SHA_256 = "HmacSHA256";
     private static final String PBKDF2_WITH_HMAC_SHA256 = "PBKDF2WithHmacSHA256";
 
-    public boolean passwordMatches(
+    /**
+     * PostgreSQL SQLSTATE {@code 42501} (insufficient_privilege). Raised when the current role is
+     * not allowed to read {@code pg_authid} (e.g. on AWS RDS, where the password column is hidden
+     * even from the master user).
+     */
+    private static final String SQLSTATE_INSUFFICIENT_PRIVILEGE = "42501";
+
+    /**
+     * Result of comparing a desired password against what PostgreSQL currently stores.
+     */
+    public enum PasswordCheck {
+        /** The stored verifier matches the desired password. */
+        MATCH,
+        /** The stored verifier does not match the desired password (or no usable verifier exists). */
+        MISMATCH,
+        /** The verifier could not be read (e.g. {@code pg_authid} access denied on RDS). */
+        UNVERIFIABLE
+    }
+
+    /**
+     * Compare the desired password against the verifier PostgreSQL stores in {@code pg_authid}.
+     * <p>
+     * Returns {@link PasswordCheck#UNVERIFIABLE} when {@code pg_authid} cannot be read (e.g. on AWS
+     * RDS, where SELECT is denied to every role), so callers can fall back to comparing the tracked
+     * Secret version instead of treating the situation as a mismatch and rewriting the password on
+     * every reconcile.
+     * <p>
+     * The privilege is probed with {@code has_table_privilege} <em>before</em> touching
+     * {@code pg_authid}. This matters because {@code checkPassword} runs inside the reconcile
+     * transaction: reading {@code pg_authid} without access raises SQLSTATE {@code 42501}, which
+     * aborts the whole transaction (SQLSTATE {@code 25P02}) and makes every following write — such
+     * as the {@code ALTER ROLE} that rotates the password — fail. {@code has_table_privilege} is
+     * world-readable, so probing it first never poisons the transaction.
+     */
+    public PasswordCheck checkPassword(
             DSLContext dsl,
             RoleSpec spec,
             String expectedPassword
     ) {
-        var currentPasswordVerifier = dsl
-                .select(PG_AUTHID.ROLPASSWORD)
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
-                .fetchSingle(PG_AUTHID.ROLPASSWORD);
+        // Probe access first: reading pg_authid without permission raises 42501 and aborts the
+        // surrounding transaction. has_table_privilege is world-readable and safe to call here.
+        var canReadAuthid = Boolean.TRUE.equals(
+                dsl.select(field(
+                                "has_table_privilege({0}, 'SELECT')",
+                                Boolean.class,
+                                val("pg_catalog.pg_authid")
+                        ))
+                        .fetchOne(0, Boolean.class)
+        );
+
+        if (!canReadAuthid) {
+            log.debug(
+                    "Cannot read pg_authid to verify the password for role [{}]; falling back to tracked Secret version",
+                    spec.getName()
+            );
+            return PasswordCheck.UNVERIFIABLE;
+        }
+
+        String currentPasswordVerifier;
+        try {
+            currentPasswordVerifier = dsl
+                    .select(PG_AUTHID.ROLPASSWORD)
+                    .from(PG_AUTHID)
+                    .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
+                    .fetchSingle(PG_AUTHID.ROLPASSWORD);
+        } catch (DataAccessException e) {
+            // Defensive only. The has_table_privilege probe above is the real guard against 42501;
+            // this catch just handles the narrow TOCTOU case where SELECT privilege is revoked
+            // between the probe and this read. Note it cannot un-poison the transaction: if the
+            // SELECT does raise 42501 the transaction is already aborted server-side, so a later
+            // write in the same transaction will still fail with 25P02 and the reconcile retries.
+            if (isInsufficientPrivilege(e)) {
+                log.debug(
+                        "Cannot read pg_authid to verify the password for role [{}]; falling back to tracked Secret version",
+                        spec.getName()
+                );
+                return PasswordCheck.UNVERIFIABLE;
+            }
+            throw e;
+        }
 
         if (currentPasswordVerifier == null || currentPasswordVerifier.isBlank()) {
-            return false;
+            return PasswordCheck.MISMATCH;
         }
 
         // PostgreSQL stores either:
         // - SCRAM verifier: SCRAM-SHA-256$<iterations>:<saltB64>$<storedKeyB64>:<serverKeyB64>
         // - or legacy md5: md5<md5(password + username)>
         if (currentPasswordVerifier.startsWith("SCRAM-SHA-256$")) {
-            return verifyPostgresScramSha256(
-                    currentPasswordVerifier,
-                    expectedPassword
-            );
+            return verifyPostgresScramSha256(currentPasswordVerifier, expectedPassword)
+                    ? PasswordCheck.MATCH
+                    : PasswordCheck.MISMATCH;
         }
 
         if (currentPasswordVerifier.startsWith(MD5.toLowerCase(Locale.ROOT))) {
-            return verifyPostgresMd5(
-                    currentPasswordVerifier,
-                    expectedPassword,
-                    spec.getName()
-            );
+            return verifyPostgresMd5(currentPasswordVerifier, expectedPassword, spec.getName())
+                    ? PasswordCheck.MATCH
+                    : PasswordCheck.MISMATCH;
         }
 
         // Unknown format (or plain text, which PG should not store in rolpassword)
+        return PasswordCheck.MISMATCH;
+    }
+
+    /**
+     * Convenience wrapper around {@link #checkPassword}. Returns {@code true} only when the verifier
+     * could be read and matched; {@link PasswordCheck#UNVERIFIABLE} is reported as {@code false}.
+     */
+    public boolean passwordMatches(
+            DSLContext dsl,
+            RoleSpec spec,
+            String expectedPassword
+    ) {
+        return checkPassword(dsl, spec, expectedPassword) == PasswordCheck.MATCH;
+    }
+
+    private static boolean isInsufficientPrivilege(DataAccessException e) {
+        if (SQLSTATE_INSUFFICIENT_PRIVILEGE.equals(e.sqlState())) {
+            return true;
+        }
+
+        // Fall back to inspecting the wrapped SQLException chain, in case the state is not surfaced
+        // directly on the jOOQ exception.
+        for (Throwable cause = e.getCause(); cause != null; cause = cause.getCause()) {
+            if (cause instanceof SQLException sqlException
+                    && SQLSTATE_INSUFFICIENT_PRIVILEGE.equals(sqlException.getSQLState())) {
+                return true;
+            }
+        }
+
         return false;
     }
 

@@ -8,6 +8,7 @@ import it.aboutbits.postgresql._support.testdata.persisted.Given;
 import it.aboutbits.postgresql.core.CRPhase;
 import it.aboutbits.postgresql.core.CRStatus;
 import it.aboutbits.postgresql.core.PostgreSQLAuthenticationService;
+import it.aboutbits.postgresql.core.PostgreSQLAuthenticationService.PasswordCheck;
 import it.aboutbits.postgresql.core.PostgreSQLContextFactory;
 import it.aboutbits.postgresql.core.ResourceRef;
 import lombok.RequiredArgsConstructor;
@@ -26,6 +27,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
@@ -35,7 +37,10 @@ import static it.aboutbits.postgresql.core.KubernetesService.SECRET_DATA_BASIC_A
 import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_AUTHID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.jooq.impl.DSL.query;
 import static org.jooq.impl.DSL.role;
+import static org.jooq.impl.DSL.using;
+import static org.jooq.impl.DSL.val;
 
 @QuarkusTest
 @RequiredArgsConstructor
@@ -90,6 +95,10 @@ class RoleReconcilerTest {
 
         assertThat(roleService.roleExists(dsl, role.getSpec())).isTrue();
         assertThat(roleService.roleLoginMatches(dsl, role.getSpec())).isTrue();
+
+        // A login role tracks the applied password Secret version so changes can be detected even
+        // when pg_authid cannot be read to verify the password directly (e.g. on RDS).
+        assertThat(role.getStatus().getAppliedPasswordSecretVersion()).isNotBlank();
     }
 
     @Test
@@ -126,6 +135,9 @@ class RoleReconcilerTest {
 
         assertThat(roleService.roleExists(dsl, role.getSpec())).isTrue();
         assertThat(roleService.roleLoginMatches(dsl, role.getSpec())).isTrue();
+
+        // A NOLOGIN role has no password, so no Secret version is tracked.
+        assertThat(role.getStatus().getAppliedPasswordSecretVersion()).isNull();
     }
 
     @Test
@@ -192,6 +204,188 @@ class RoleReconcilerTest {
 
         // then
         assertThat(getRoleFlagValue(dsl, roleName, PG_AUTHID.ROLCANLOGIN)).isFalse();
+    }
+
+    @Test
+    @DisplayName(
+            "When pg_authid cannot be read (like on RDS), reads use pg_roles and password checks report UNVERIFIABLE"
+    )
+    void restrictedRole_cannotReadPgAuthid_usesPgRolesAndReportsUnverifiable() {
+        // given: a reconciled login role we can query for
+        var clusterConnection = given.one()
+                .clusterConnection()
+                .withName("test-connection-role-restricted")
+                .returnFirst();
+
+        var roleName = "test-role-restricted";
+
+        var role = given.one()
+                .role()
+                .withName(roleName)
+                .withClusterConnectionName(clusterConnection.getMetadata().getName())
+                .withPasswordSecretRef(clusterConnection.getSpec().getAdminSecretRef())
+                .returnFirst();
+
+        var adminDsl = postgreSQLContextFactory.getDSLContext(clusterConnection);
+
+        // and: a non-superuser login role. On vanilla PostgreSQL (as on RDS) SELECT on pg_authid is
+        // revoked from non-superusers, so connecting as this role reproduces the RDS restriction.
+        var limitedRoleName = "test-role-limited";
+        var limitedPassword = "limited-password";
+
+        adminDsl.execute(query(
+                "drop role if exists {0}",
+                role(limitedRoleName)
+        ));
+        adminDsl.execute(query(
+                "create role {0} with login password {1}",
+                role(limitedRoleName),
+                val(limitedPassword)
+        ));
+
+        try {
+            var spec = clusterConnection.getSpec();
+            var jdbcUrl = "jdbc:postgresql://%s:%d/%s".formatted(
+                    spec.getHost(),
+                    spec.getPort(),
+                    spec.getDatabase()
+            );
+
+            var properties = new Properties();
+            properties.setProperty("user", limitedRoleName);
+            properties.setProperty("password", limitedPassword);
+
+            try (var limitedDsl = using(jdbcUrl, properties)) {
+                // then: existence check works because roleExists() now reads the pg_roles view,
+                // which is readable by everyone (this used to throw "permission denied for pg_authid")
+                assertThat(roleService.roleExists(limitedDsl, role.getSpec())).isTrue();
+                assertThat(roleService.roleLoginMatches(limitedDsl, role.getSpec())).isTrue();
+                assertThat(roleService.fetchCurrentFlags(limitedDsl, role.getSpec())).isNotNull();
+
+                // and: verifying the password is not possible without pg_authid, reported as UNVERIFIABLE
+                assertThat(
+                        postgreSQLAuthenticationService.checkPassword(
+                                limitedDsl,
+                                role.getSpec(),
+                                "any-password"
+                        )
+                ).isEqualTo(PasswordCheck.UNVERIFIABLE);
+            }
+        } finally {
+            adminDsl.execute(query(
+                    "drop role if exists {0}",
+                    role(limitedRoleName)
+            ));
+        }
+    }
+
+    @Test
+    @DisplayName(
+            "When reconciling over a connection that cannot read pg_authid (like on RDS), a password change should still be applied"
+    )
+    void restrictedConnection_passwordChange_isAppliedThroughTransaction() {
+        // given: a superuser connection we use to set up and to verify the result
+        var adminClusterConnection = given.one()
+                .clusterConnection()
+                .withName("test-connection-rds-admin")
+                .returnFirst();
+
+        var adminDsl = postgreSQLContextFactory.getDSLContext(adminClusterConnection);
+
+        // and: a non-superuser CREATEROLE login role. As on RDS, it cannot SELECT pg_authid, but it
+        // can create and alter the roles it owns.
+        var limitedAdminName = "test_rds_limited_admin";
+        var limitedAdminPassword = "limited-admin-password";
+
+        adminDsl.execute(query("drop role if exists {0}", role(limitedAdminName)));
+        adminDsl.execute(query(
+                "create role {0} with login createrole password {1}",
+                role(limitedAdminName),
+                val(limitedAdminPassword)
+        ));
+
+        var roleName = "test-role-rds-password-change";
+
+        // and: a ClusterConnection that authenticates as the limited (RDS-like) role
+        var limitedSecretRef = given.one()
+                .secretRef()
+                .withUsername(limitedAdminName)
+                .withPassword(limitedAdminPassword)
+                .returnFirst();
+
+        var limitedClusterConnection = given.one()
+                .clusterConnection()
+                .withName("test-connection-rds-limited")
+                .withAdminSecretRef(limitedSecretRef)
+                .returnFirst();
+
+        var initialPassword = "initial-password";
+        var newPassword = "new-password";
+
+        var passwordSecretRef = given.one()
+                .secretRef()
+                .withPassword(initialPassword)
+                .returnFirst();
+
+        var passwordSecret = kubernetesClient.secrets()
+                .inNamespace(kubernetesClient.getNamespace())
+                .withName(passwordSecretRef.getName())
+                .require();
+
+        // when: create the Role over the limited connection (the create path does not read pg_authid)
+        var role = given.one()
+                .role()
+                .withName(roleName)
+                .withClusterConnectionName(limitedClusterConnection.getMetadata().getName())
+                .withPasswordSecretRef(passwordSecretRef)
+                .returnFirst();
+
+        try {
+            // then: the initial password is applied
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollInterval(100, TimeUnit.MILLISECONDS)
+                    .until(() -> postgreSQLAuthenticationService.passwordMatches(
+                            adminDsl,
+                            role.getSpec(),
+                            initialPassword
+                    ));
+
+            // when: the password is rotated in the Secret. This triggers a reconcile that must run
+            // ALTER ROLE through the same transaction in which reading pg_authid fails.
+            passwordSecret.getMetadata().setManagedFields(null);
+            var rotatedSecret = new SecretBuilder(passwordSecret)
+                    .addToStringData(SECRET_DATA_BASIC_AUTH_PASSWORD_KEY, newPassword)
+                    .build();
+
+            kubernetesClient.secrets()
+                    .inNamespace(kubernetesClient.getNamespace())
+                    .resource(rotatedSecret)
+                    .serverSideApply();
+
+            // then: the new password should eventually be applied
+            await().atMost(10, TimeUnit.SECONDS)
+                    .pollInterval(200, TimeUnit.MILLISECONDS)
+                    .until(() -> postgreSQLAuthenticationService.passwordMatches(
+                            adminDsl,
+                            role.getSpec(),
+                            newPassword
+                    ));
+        } finally {
+            // Delete the Role CR first so the operator drops the DB role via the still-valid limited
+            // connection, then drop the limited admin role as superuser.
+            kubernetesClient.resources(Role.class)
+                    .inNamespace(role.getMetadata().getNamespace())
+                    .withName(roleName)
+                    .withTimeout(5, TimeUnit.SECONDS)
+                    .delete();
+
+            await().atMost(5, TimeUnit.SECONDS)
+                    .pollInterval(100, TimeUnit.MILLISECONDS)
+                    .until(() -> !roleService.roleExists(adminDsl, role.getSpec()));
+
+            adminDsl.execute(query("drop role if exists {0}", role(roleName)));
+            adminDsl.execute(query("drop role if exists {0}", role(limitedAdminName)));
+        }
     }
 
     @Test
@@ -955,7 +1149,7 @@ class RoleReconcilerTest {
                     );
                 })
                 .usingRecursiveComparison()
-                .ignoringFields("lastProbeTime", "lastPhaseTransitionTime")
+                .ignoringFields("lastProbeTime", "lastPhaseTransitionTime", "appliedPasswordSecretVersion")
                 .isEqualTo(expectedStatus);
     }
 }

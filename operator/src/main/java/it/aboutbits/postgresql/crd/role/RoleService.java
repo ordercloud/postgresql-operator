@@ -15,8 +15,8 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Objects;
 
-import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_AUTHID;
 import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_AUTH_MEMBERS;
+import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_ROLES;
 import static org.jooq.impl.DSL.field;
 import static org.jooq.impl.DSL.keyword;
 import static org.jooq.impl.DSL.multiset;
@@ -35,8 +35,8 @@ public final class RoleService {
             RoleSpec spec
     ) {
         return tx.fetchExists(selectOne()
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
+                .from(PG_ROLES)
+                .where(PG_ROLES.ROLNAME.eq(spec.getName()))
         );
     }
 
@@ -68,6 +68,7 @@ public final class RoleService {
     public void alterRole(
             DSLContext tx,
             RoleSpec spec,
+            RoleSpec.Flags currentFlags,
             boolean changePassword,
             @Nullable String password
     ) {
@@ -78,6 +79,7 @@ public final class RoleService {
                 buildAlterRole(
                         roleName,
                         flags,
+                        currentFlags,
                         changePassword,
                         password
                 )
@@ -122,11 +124,13 @@ public final class RoleService {
 
         return tx
                 .select(Routines.shobjDescription(
-                        PG_AUTHID.OID,
-                        val(PG_AUTHID.getUnqualifiedName().last())
+                        PG_ROLES.OID,
+                        // Roles live in the pg_authid catalog; shared comments are keyed by that
+                        // catalog name even though we read the oid from the pg_roles view.
+                        val("pg_authid")
                 ))
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(roleName))
+                .from(PG_ROLES)
+                .where(PG_ROLES.ROLNAME.eq(roleName))
                 .fetchOneInto(String.class);
     }
 
@@ -137,9 +141,9 @@ public final class RoleService {
         var loginExpected = spec.getPasswordSecretRef() != null;
 
         var canLogin = tx.fetchExists(selectOne()
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
-                .and(PG_AUTHID.ROLCANLOGIN.isTrue())
+                .from(PG_ROLES)
+                .where(PG_ROLES.ROLNAME.eq(spec.getName()))
+                .and(PG_ROLES.ROLCANLOGIN.isTrue())
         );
 
         return loginExpected == canLogin;
@@ -149,25 +153,25 @@ public final class RoleService {
             DSLContext tx,
             RoleSpec spec
     ) {
-        var member = PG_AUTHID.as("member");
-        var parent = PG_AUTHID.as("parent");
+        var member = PG_ROLES.as("member");
+        var parent = PG_ROLES.as("parent");
 
         return tx
                 .select(
-                        PG_AUTHID.ROLSUPER.as("superuser"),
-                        PG_AUTHID.ROLCREATEDB.as("createdb"),
-                        PG_AUTHID.ROLCREATEROLE.as("createrole"),
-                        PG_AUTHID.ROLINHERIT.as("inherit"),
-                        PG_AUTHID.ROLREPLICATION.as("replication"),
-                        PG_AUTHID.ROLBYPASSRLS.as("bypassrls"),
-                        PG_AUTHID.ROLCONNLIMIT.as("connectionLimit"),
-                        field("nullif({0}, 'infinity')", PG_AUTHID.ROLVALIDUNTIL.getDataType(), PG_AUTHID.ROLVALIDUNTIL).as("validUntil"),
+                        PG_ROLES.ROLSUPER.as("superuser"),
+                        PG_ROLES.ROLCREATEDB.as("createdb"),
+                        PG_ROLES.ROLCREATEROLE.as("createrole"),
+                        PG_ROLES.ROLINHERIT.as("inherit"),
+                        PG_ROLES.ROLREPLICATION.as("replication"),
+                        PG_ROLES.ROLBYPASSRLS.as("bypassrls"),
+                        PG_ROLES.ROLCONNLIMIT.as("connectionLimit"),
+                        field("nullif({0}, 'infinity')", PG_ROLES.ROLVALIDUNTIL.getDataType(), PG_ROLES.ROLVALIDUNTIL).as("validUntil"),
                         multiset(
                                 select(parent.ROLNAME)
                                         .from(PG_AUTH_MEMBERS)
                                         .join(member).on(member.OID.eq(PG_AUTH_MEMBERS.MEMBER))
                                         .join(parent).on(parent.OID.eq(PG_AUTH_MEMBERS.ROLEID))
-                                        .where(member.OID.eq(PG_AUTHID.OID))
+                                        .where(member.OID.eq(PG_ROLES.OID))
                                         .orderBy(parent.ROLNAME)
                         ).as("inRole").convertFrom(result -> result.map(Record1::value1)),
                         multiset(
@@ -175,12 +179,12 @@ public final class RoleService {
                                         .from(PG_AUTH_MEMBERS)
                                         .join(parent).on(parent.OID.eq(PG_AUTH_MEMBERS.ROLEID))
                                         .join(member).on(member.OID.eq(PG_AUTH_MEMBERS.MEMBER))
-                                        .where(parent.OID.eq(PG_AUTHID.OID))
+                                        .where(parent.OID.eq(PG_ROLES.OID))
                                         .orderBy(member.ROLNAME)
                         ).as("role").convertFrom(result -> result.map(Record1::value1))
                 )
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
+                .from(PG_ROLES)
+                .where(PG_ROLES.ROLNAME.eq(spec.getName()))
                 .fetchSingleInto(RoleSpec.Flags.class);
     }
 
@@ -325,9 +329,27 @@ public final class RoleService {
         );
     }
 
+    /**
+     * Append the token for a privilege-gated role attribute to {@code options} only when the desired
+     * value differs from the current one. See {@link #buildAlterRole} for why naming such attributes
+     * unconditionally breaks on clusters (e.g. AWS RDS) whose admin is not a superuser.
+     */
+    private static void addAttributeIfChanged(
+            ArrayList<QueryPart> options,
+            boolean desired,
+            boolean current,
+            RoleFlag enabled,
+            RoleFlag disabled
+    ) {
+        if (desired != current) {
+            options.add(keyword(desired ? enabled.flag() : disabled.flag()));
+        }
+    }
+
     private static Query buildAlterRole(
             String roleName,
             RoleSpec.Flags flags,
+            RoleSpec.Flags currentFlags,
             boolean changePassword,
             @Nullable String password
     ) {
@@ -351,30 +373,54 @@ public final class RoleService {
             options.add(val(password));
         }
 
-        // Explicitly set the expected state to make the statement idempotent
-        options.add(keyword(flags.isSuperuser()
-                ? RoleFlag.SUPERUSER.flag()
-                : RoleFlag.NO_SUPERUSER.flag()
-        ));
-        options.add(keyword(flags.isCreatedb()
-                ? RoleFlag.CREATEDB.flag()
-                : RoleFlag.NO_CREATEDB.flag()
-        ));
-        options.add(keyword(flags.isCreaterole()
-                ? RoleFlag.CREATEROLE.flag()
-                : RoleFlag.NO_CREATEROLE.flag()
-        ));
+        // The role attributes below (SUPERUSER, CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS) are
+        // privilege-gated: since PostgreSQL 16, merely *naming* one of these in ALTER ROLE requires
+        // the executing role to hold that attribute itself (and only a superuser may name SUPERUSER
+        // at all) - even when the value is unchanged. On managed clusters like AWS RDS the admin is
+        // not a real superuser, so unconditionally emitting e.g. NOSUPERUSER makes every update fail
+        // with "permission denied to alter role". We therefore emit each of these only when it
+        // actually differs from the role's current state; a genuine change still (correctly)
+        // requires the matching privilege. INHERIT, CONNECTION LIMIT and VALID UNTIL are not
+        // privilege-gated and are always safe to assert.
+        addAttributeIfChanged(
+                options,
+                flags.isSuperuser(),
+                currentFlags.isSuperuser(),
+                RoleFlag.SUPERUSER,
+                RoleFlag.NO_SUPERUSER
+        );
+        addAttributeIfChanged(
+                options,
+                flags.isCreatedb(),
+                currentFlags.isCreatedb(),
+                RoleFlag.CREATEDB,
+                RoleFlag.NO_CREATEDB
+        );
+        addAttributeIfChanged(
+                options,
+                flags.isCreaterole(),
+                currentFlags.isCreaterole(),
+                RoleFlag.CREATEROLE,
+                RoleFlag.NO_CREATEROLE
+        );
+        addAttributeIfChanged(
+                options,
+                flags.isReplication(),
+                currentFlags.isReplication(),
+                RoleFlag.REPLICATION,
+                RoleFlag.NO_REPLICATION
+        );
+        addAttributeIfChanged(
+                options,
+                flags.isBypassrls(),
+                currentFlags.isBypassrls(),
+                RoleFlag.BYPASSRLS,
+                RoleFlag.NO_BYPASSRLS
+        );
+
         options.add(keyword(flags.isInherit()
                 ? RoleFlag.INHERIT.flag()
                 : RoleFlag.NO_INHERIT.flag()
-        ));
-        options.add(keyword(flags.isReplication()
-                ? RoleFlag.REPLICATION.flag()
-                : RoleFlag.NO_REPLICATION.flag()
-        ));
-        options.add(keyword(flags.isBypassrls()
-                ? RoleFlag.BYPASSRLS.flag()
-                : RoleFlag.NO_BYPASSRLS.flag()
         ));
 
         options.add(keyword(RoleFlag.CONNECTION_LIMIT.flag()));
