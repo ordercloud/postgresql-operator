@@ -8,6 +8,7 @@ import it.aboutbits.postgresql._support.testdata.persisted.Given;
 import it.aboutbits.postgresql.core.CRPhase;
 import it.aboutbits.postgresql.core.CRStatus;
 import it.aboutbits.postgresql.core.PostgreSQLAuthenticationService;
+import it.aboutbits.postgresql.core.PostgreSQLAuthenticationService.PasswordCheck;
 import it.aboutbits.postgresql.core.PostgreSQLContextFactory;
 import it.aboutbits.postgresql.core.ResourceRef;
 import lombok.RequiredArgsConstructor;
@@ -26,6 +27,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
@@ -35,7 +37,10 @@ import static it.aboutbits.postgresql.core.KubernetesService.SECRET_DATA_BASIC_A
 import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_AUTHID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.jooq.impl.DSL.query;
 import static org.jooq.impl.DSL.role;
+import static org.jooq.impl.DSL.using;
+import static org.jooq.impl.DSL.val;
 
 @QuarkusTest
 @RequiredArgsConstructor
@@ -90,6 +95,10 @@ class RoleReconcilerTest {
 
         assertThat(roleService.roleExists(dsl, role.getSpec())).isTrue();
         assertThat(roleService.roleLoginMatches(dsl, role.getSpec())).isTrue();
+
+        // A login role tracks the applied password Secret version so changes can be detected even
+        // when pg_authid cannot be read to verify the password directly (e.g. on RDS).
+        assertThat(role.getStatus().getAppliedPasswordSecretVersion()).isNotBlank();
     }
 
     @Test
@@ -126,6 +135,9 @@ class RoleReconcilerTest {
 
         assertThat(roleService.roleExists(dsl, role.getSpec())).isTrue();
         assertThat(roleService.roleLoginMatches(dsl, role.getSpec())).isTrue();
+
+        // A NOLOGIN role has no password, so no Secret version is tracked.
+        assertThat(role.getStatus().getAppliedPasswordSecretVersion()).isNull();
     }
 
     @Test
@@ -192,6 +204,79 @@ class RoleReconcilerTest {
 
         // then
         assertThat(getRoleFlagValue(dsl, roleName, PG_AUTHID.ROLCANLOGIN)).isFalse();
+    }
+
+    @Test
+    @DisplayName(
+            "When pg_authid cannot be read (like on RDS), reads use pg_roles and password checks report UNVERIFIABLE"
+    )
+    void restrictedRole_cannotReadPgAuthid_usesPgRolesAndReportsUnverifiable() {
+        // given: a reconciled login role we can query for
+        var clusterConnection = given.one()
+                .clusterConnection()
+                .withName("test-connection-role-restricted")
+                .returnFirst();
+
+        var roleName = "test-role-restricted";
+
+        var role = given.one()
+                .role()
+                .withName(roleName)
+                .withClusterConnectionName(clusterConnection.getMetadata().getName())
+                .withPasswordSecretRef(clusterConnection.getSpec().getAdminSecretRef())
+                .returnFirst();
+
+        var adminDsl = postgreSQLContextFactory.getDSLContext(clusterConnection);
+
+        // and: a non-superuser login role. On vanilla PostgreSQL (as on RDS) SELECT on pg_authid is
+        // revoked from non-superusers, so connecting as this role reproduces the RDS restriction.
+        var limitedRoleName = "test-role-limited";
+        var limitedPassword = "limited-password";
+
+        adminDsl.execute(query(
+                "drop role if exists {0}",
+                role(limitedRoleName)
+        ));
+        adminDsl.execute(query(
+                "create role {0} with login password {1}",
+                role(limitedRoleName),
+                val(limitedPassword)
+        ));
+
+        try {
+            var spec = clusterConnection.getSpec();
+            var jdbcUrl = "jdbc:postgresql://%s:%d/%s".formatted(
+                    spec.getHost(),
+                    spec.getPort(),
+                    spec.getDatabase()
+            );
+
+            var properties = new Properties();
+            properties.setProperty("user", limitedRoleName);
+            properties.setProperty("password", limitedPassword);
+
+            try (var limitedDsl = using(jdbcUrl, properties)) {
+                // then: existence check works because roleExists() now reads the pg_roles view,
+                // which is readable by everyone (this used to throw "permission denied for pg_authid")
+                assertThat(roleService.roleExists(limitedDsl, role.getSpec())).isTrue();
+                assertThat(roleService.roleLoginMatches(limitedDsl, role.getSpec())).isTrue();
+                assertThat(roleService.fetchCurrentFlags(limitedDsl, role.getSpec())).isNotNull();
+
+                // and: verifying the password is not possible without pg_authid, reported as UNVERIFIABLE
+                assertThat(
+                        postgreSQLAuthenticationService.checkPassword(
+                                limitedDsl,
+                                role.getSpec(),
+                                "any-password"
+                        )
+                ).isEqualTo(PasswordCheck.UNVERIFIABLE);
+            }
+        } finally {
+            adminDsl.execute(query(
+                    "drop role if exists {0}",
+                    role(limitedRoleName)
+            ));
+        }
     }
 
     @Test
@@ -955,7 +1040,7 @@ class RoleReconcilerTest {
                     );
                 })
                 .usingRecursiveComparison()
-                .ignoringFields("lastProbeTime", "lastPhaseTransitionTime")
+                .ignoringFields("lastProbeTime", "lastPhaseTransitionTime", "appliedPasswordSecretVersion")
                 .isEqualTo(expectedStatus);
     }
 }

@@ -15,8 +15,8 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Objects;
 
-import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_AUTHID;
 import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_AUTH_MEMBERS;
+import static it.aboutbits.postgresql.core.infrastructure.persistence.Tables.PG_ROLES;
 import static org.jooq.impl.DSL.field;
 import static org.jooq.impl.DSL.keyword;
 import static org.jooq.impl.DSL.multiset;
@@ -35,8 +35,8 @@ public final class RoleService {
             RoleSpec spec
     ) {
         return tx.fetchExists(selectOne()
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
+                .from(PG_ROLES)
+                .where(PG_ROLES.ROLNAME.eq(spec.getName()))
         );
     }
 
@@ -122,11 +122,13 @@ public final class RoleService {
 
         return tx
                 .select(Routines.shobjDescription(
-                        PG_AUTHID.OID,
-                        val(PG_AUTHID.getUnqualifiedName().last())
+                        PG_ROLES.OID,
+                        // Roles live in the pg_authid catalog; shared comments are keyed by that
+                        // catalog name even though we read the oid from the pg_roles view.
+                        val("pg_authid")
                 ))
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(roleName))
+                .from(PG_ROLES)
+                .where(PG_ROLES.ROLNAME.eq(roleName))
                 .fetchOneInto(String.class);
     }
 
@@ -137,9 +139,9 @@ public final class RoleService {
         var loginExpected = spec.getPasswordSecretRef() != null;
 
         var canLogin = tx.fetchExists(selectOne()
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
-                .and(PG_AUTHID.ROLCANLOGIN.isTrue())
+                .from(PG_ROLES)
+                .where(PG_ROLES.ROLNAME.eq(spec.getName()))
+                .and(PG_ROLES.ROLCANLOGIN.isTrue())
         );
 
         return loginExpected == canLogin;
@@ -149,25 +151,25 @@ public final class RoleService {
             DSLContext tx,
             RoleSpec spec
     ) {
-        var member = PG_AUTHID.as("member");
-        var parent = PG_AUTHID.as("parent");
+        var member = PG_ROLES.as("member");
+        var parent = PG_ROLES.as("parent");
 
         return tx
                 .select(
-                        PG_AUTHID.ROLSUPER.as("superuser"),
-                        PG_AUTHID.ROLCREATEDB.as("createdb"),
-                        PG_AUTHID.ROLCREATEROLE.as("createrole"),
-                        PG_AUTHID.ROLINHERIT.as("inherit"),
-                        PG_AUTHID.ROLREPLICATION.as("replication"),
-                        PG_AUTHID.ROLBYPASSRLS.as("bypassrls"),
-                        PG_AUTHID.ROLCONNLIMIT.as("connectionLimit"),
-                        field("nullif({0}, 'infinity')", PG_AUTHID.ROLVALIDUNTIL.getDataType(), PG_AUTHID.ROLVALIDUNTIL).as("validUntil"),
+                        PG_ROLES.ROLSUPER.as("superuser"),
+                        PG_ROLES.ROLCREATEDB.as("createdb"),
+                        PG_ROLES.ROLCREATEROLE.as("createrole"),
+                        PG_ROLES.ROLINHERIT.as("inherit"),
+                        PG_ROLES.ROLREPLICATION.as("replication"),
+                        PG_ROLES.ROLBYPASSRLS.as("bypassrls"),
+                        PG_ROLES.ROLCONNLIMIT.as("connectionLimit"),
+                        field("nullif({0}, 'infinity')", PG_ROLES.ROLVALIDUNTIL.getDataType(), PG_ROLES.ROLVALIDUNTIL).as("validUntil"),
                         multiset(
                                 select(parent.ROLNAME)
                                         .from(PG_AUTH_MEMBERS)
                                         .join(member).on(member.OID.eq(PG_AUTH_MEMBERS.MEMBER))
                                         .join(parent).on(parent.OID.eq(PG_AUTH_MEMBERS.ROLEID))
-                                        .where(member.OID.eq(PG_AUTHID.OID))
+                                        .where(member.OID.eq(PG_ROLES.OID))
                                         .orderBy(parent.ROLNAME)
                         ).as("inRole").convertFrom(result -> result.map(Record1::value1)),
                         multiset(
@@ -175,12 +177,12 @@ public final class RoleService {
                                         .from(PG_AUTH_MEMBERS)
                                         .join(parent).on(parent.OID.eq(PG_AUTH_MEMBERS.ROLEID))
                                         .join(member).on(member.OID.eq(PG_AUTH_MEMBERS.MEMBER))
-                                        .where(parent.OID.eq(PG_AUTHID.OID))
+                                        .where(parent.OID.eq(PG_ROLES.OID))
                                         .orderBy(member.ROLNAME)
                         ).as("role").convertFrom(result -> result.map(Record1::value1))
                 )
-                .from(PG_AUTHID)
-                .where(PG_AUTHID.ROLNAME.eq(spec.getName()))
+                .from(PG_ROLES)
+                .where(PG_ROLES.ROLNAME.eq(spec.getName()))
                 .fetchSingleInto(RoleSpec.Flags.class);
     }
 
